@@ -2,101 +2,131 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from pptx import Presentation
 from openai import OpenAI
 import io
+import re
 import os
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 router = APIRouter()
 
 # =========================================================
-# [설정] 제외 키워드
+# [키워드 설정] (사용자님의 코드를 그대로 가져왔습니다)
 # =========================================================
 EXCLUDE_KEYWORDS = [
     "유사", "사례", "실적", "reference", "case", "history", "result",
-    "강사프로필", "수행실적", "제안사", "회사소개", "appendix", "별첨"
+    "강사프로필", "수행실적", "제안사", "회사소개"
+]
+
+OVERVIEW_KEYWORDS = [
+    "과정 소개", "과정소개", "과정 개요", "과정개요", 
+    "교육 소개", "교육소개", "교육 개요", "교육개요", 
+    "개요", "소개", "overview", "summary", "요약", "제안 배경", "기획 의도",
+    "목표", "대상" 
+]
+
+CURRICULUM_KEYWORDS = [
+    "커리큘럼", "세부과정", "교육과정", "교육내용", "모듈구성", 
+    "상세과정", "프로그램", "module", "schedule", "curriculum",
+    "모듈", "구성", "일정", "방법", "contents", "agenda", "syllabus",
+    "1일차", "2일차", "1h", "2h", "time" 
 ]
 
 # =========================================================
-# [핵심] 버전을 타지 않는 '무조건 재귀 탐색' (Duck Typing)
+# [기능 1] 텍스트 추출 (재귀 + Duck Typing)
+# 텍스트가 그룹(Group) 안에 있어도 무조건 꺼내는 핵심 로직입니다.
 # =========================================================
-def get_text_from_shape_recursive(shape):
-    """
-    모양(Type)을 따지지 않고, 텍스트나 하위 도형이 있으면 무조건 추출합니다.
-    (라이브러리 버전이 달라도 100% 동작함)
-    """
-    text_parts = []
+def normalize(text):
+    return re.sub(r'\s+', '', str(text).lower())
 
+def get_text_from_shape_recursive(shape):
+    """도형, 표, 그룹 내부를 가리지 않고 텍스트를 추출합니다."""
+    text_parts = []
     try:
-        # 1. 텍스트가 있는가? (TextFrame)
+        # 1. 텍스트 박스
         if hasattr(shape, "text") and shape.text and shape.text.strip():
             text_parts.append(shape.text.strip())
-
-        # 2. 표인가? (Table)
+        
+        # 2. 표 (Table)
         if hasattr(shape, "table") and shape.table:
             for row in shape.table.rows:
                 row_cells = [c.text.replace('\n', ' ').strip() for c in row.cells if c.text.strip()]
                 if row_cells:
                     text_parts.append(f"| {' | '.join(row_cells)} |")
-
-        # 3. 자식을 가진 컨테이너(그룹)인가? 
-        # (MSO_SHAPE_TYPE 확인 대신, shapes 속성이 있는지로 판단 -> 버전 호환성 해결)
+        
+        # 3. 그룹 (재귀 탐색) - 사용자님이 원하신 재귀 로직 적용
         if hasattr(shape, "shapes"):
             for child in shape.shapes:
                 text_parts.extend(get_text_from_shape_recursive(child))
-                
-    except Exception as e:
-        # 특정 도형에서 에러가 나도 멈추지 않고 무시
-        print(f"⚠️ 도형 처리 중 스킵: {e}")
+    except:
         pass
-
     return text_parts
 
-def extract_all_text(slide):
+def extract_text_from_slide(slide):
+    """슬라이드 전체 텍스트 추출"""
     all_texts = []
     
-    # 제목 처리
+    # 제목 처리 (Visual Title 로직 대신, 안전하게 객체 속성 확인)
     try:
         if slide.shapes.title and slide.shapes.title.text.strip():
             all_texts.append(f"### {slide.shapes.title.text.strip()}")
     except:
-        pass # 제목 없으면 패스
+        pass 
 
-    # 본문 처리
+    # 본문 처리 (제목 제외)
     for shape in slide.shapes:
-        # 제목 객체는 중복 방지를 위해 건너뜀
         try:
             if slide.shapes.title and shape == slide.shapes.title:
                 continue
         except:
             pass
-            
-        # 재귀 추출 실행
         all_texts.extend(get_text_from_shape_recursive(shape))
         
     return "\n".join(all_texts)
 
 # =========================================================
-# [LLM] 마크다운 변환
+# [기능 2] 슬라이드 분류 (사용자 로직 + 내용 기반 보완)
 # =========================================================
-def generate_markdown(filename, text_content):
-    if len(text_content) < 50: return None
+def classify_slide_by_content(full_text):
+    """
+    제목 위치(Top)에 의존하지 않고, 텍스트 내용을 보고 분류합니다.
+    (그룹 안에 제목이 숨어있을 때도 작동하기 위함)
+    """
+    norm_text = normalize(full_text)
+    
+    for key in EXCLUDE_KEYWORDS:
+        if normalize(key) in norm_text: return "EXCLUDE"
+    for key in OVERVIEW_KEYWORDS:
+        if normalize(key) in norm_text: return "OVERVIEW"
+    for key in CURRICULUM_KEYWORDS:
+        if normalize(key) in norm_text: return "CURRICULUM"
+    
+    return "OTHER"
 
-    # 너무 길면 자르기 (토큰 비용 절약 및 에러 방지)
-    safe_text = text_content[:25000]
+# =========================================================
+# [기능 3] LLM 변환 (표 강제 + 시간 보존)
+# =========================================================
+def generate_rag_markdown(filename, course_idx, overview_text, curriculum_text):
+    if len(curriculum_text) < 30: return None
+
+    # 토큰 제한 안전장치
+    safe_curriculum = curriculum_text[:20000]
 
     prompt = f"""
     당신은 '기업 교육 제안서 분석 전문가'입니다.
-    아래 텍스트는 PPT에서 추출한 커리큘럼 내용입니다.
-    
-    [지시사항]
-    1. 내용을 분석하여 **RAG용 Markdown**으로 정리해줘.
-    2. 문서 상단에 `> **Keywords**: ...` 필수 포함.
-    3. **시간 정보(1H, 2H, 09:00~) 절대 삭제 금지.**
-    4. 표 형식은 Markdown Table로 변환.
-    5. 잡담 없이 결과만 출력.
-    
-    [파일명] {filename}
-    [내용]
-    {safe_text}
+    제공된 Raw Text를 분석하여 RAG 검색에 최적화된 **Clean Markdown** 포맷으로 변환하십시오.
+
+    [Input Source]
+    - File: {filename}
+    - Context (개요): {overview_text[:3000]}
+    - Content (커리큘럼): {safe_curriculum}
+
+    [Output Rules - Strict]
+    1. **Metadata**: 문서 최상단에 `> **Keywords**: ...` 형식으로 핵심 키워드(대상, 주제, 툴 등) 나열.
+    2. **Table Formatting (필수)**: 
+       - 커리큘럼의 상세 일정, 모듈 구성은 **반드시 Markdown Table**로 작성할 것.
+       - 예시: | 모듈명 | 시간 | 주요 내용 | 교육 방법 |
+    3. **Time Preservation**: '1H', '2시간', '09:00~18:00' 등 시간 정보는 **절대 삭제 금지**.
+    4. **Filtering**: 강사 프로필, 회사 홍보 등 커리큘럼과 무관한 내용은 삭제.
+    5. **No Chit-chat**: 서론 없이 결과 Markdown만 출력.
     """
 
     try:
@@ -107,58 +137,77 @@ def generate_markdown(filename, text_content):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"❌ LLM Error: {e}")
+        print(f"LLM Error: {e}")
         return None
 
 # =========================================================
-# [Endpoint]
+# [Endpoint] 메인 핸들러
 # =========================================================
 @router.post("/parse")
 async def parse_curriculum(file: UploadFile = File(...)):
-    print(f"\n🚀 [Duck Typing Fix] 파일 처리 시작: {file.filename}")
+    print(f"🚀 Processing: {file.filename}")
     
     content = await file.read()
-    
     try:
         prs = Presentation(io.BytesIO(content))
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid PPTX file")
 
-    # 텍스트 추출 (필터링 없이 전체 수집)
-    full_text_list = []
+    courses = [] 
+    current_course = {'overview': [], 'curriculum': []}
     
+    # 1. 슬라이드 순회 (사용자님의 로직 반영: OVERVIEW마다 과정 분리)
     for i, slide in enumerate(prs.slides):
-        text = extract_all_text(slide)
+        # 재귀함수로 텍스트 추출 (그룹 내부 포함)
+        full_text = extract_text_from_slide(slide)
         
-        # 간단한 제외 키워드 체크
-        is_exclude = False
-        for key in EXCLUDE_KEYWORDS:
-            if key in text: 
-                is_exclude = True
-                break
+        # 내용 기반 분류
+        slide_type = classify_slide_by_content(full_text)
         
-        if not is_exclude and len(text.strip()) > 5:
-            full_text_list.append(f"\n--- [Slide {i+1}] ---\n{text}")
+        if slide_type == "EXCLUDE": 
+            continue
 
-    combined_text = "\n".join(full_text_list)
-    print(f"📝 추출된 텍스트 길이: {len(combined_text)}자")
+        if slide_type == "OVERVIEW":
+            # [중요] 새로운 개요가 나오면 이전 과정을 저장하고 리셋 (사용자 로직)
+            if current_course['curriculum']: 
+                courses.append(current_course)
+                current_course = {'overview': [], 'curriculum': []}
+            current_course['overview'].append(full_text)
 
-    # 결과 생성
+        elif slide_type == "CURRICULUM":
+            current_course['curriculum'].append(full_text)
+            
+        # 분류가 안 된 슬라이드(OTHER)라도 텍스트가 길면 커리큘럼으로 간주 (안전장치)
+        elif slide_type == "OTHER" and len(full_text) > 50:
+             current_course['curriculum'].append(full_text)
+
+    # 마지막에 남은 과정 추가
+    if current_course['curriculum']:
+        courses.append(current_course)
+
+    print(f"📊 감지된 과정(Courses) 수: {len(courses)}개")
+
+    # 2. LLM 변환 및 결과 생성
     results = []
-    
-    # 텍스트가 있으면 무조건 변환 시도
-    if len(combined_text) > 30:
-        md_content = generate_markdown(file.filename, combined_text)
+    for idx, course in enumerate(courses):
+        full_overview = "\n\n".join(course['overview'])
+        full_curriculum = "\n\n".join(course['curriculum'])
+        
+        md_content = generate_rag_markdown(file.filename, idx+1, full_overview, full_curriculum)
         
         if md_content:
+            # [수정됨] 파일명 새니타이징(특수문자 제거) 로직 삭제 -> 원본 파일명 유지
             base_name = os.path.splitext(file.filename)[0]
+            
+            # 과정이 여러 개일 때만 뒤에 번호 붙임, 하나면 깔끔하게 원본명 사용
+            suffix = f"_Course_{idx+1}" if len(courses) > 1 else "_Parsed"
+            suggested_filename = f"{base_name}{suffix}.md"
+            
             results.append({
-                "course_index": 1,
-                "suggested_filename": f"{base_name}_Parsed.md",
+                "course_index": idx + 1,
+                "suggested_filename": suggested_filename,
                 "markdown": md_content
             })
-    else:
-        print("🚨 여전히 텍스트가 0입니다. 이미지 파일이거나 암호화된 파일일 수 있습니다.")
 
     return {
         "domain": "curriculum",
